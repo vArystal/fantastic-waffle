@@ -1,0 +1,142 @@
+# Build the app straight out of the committed .zip and deploy it to GitHub Pages.
+#
+# The repository only needs to contain:
+#   vanta-github.zip
+#   .github/workflows/deploy.yml   (this file)
+#
+# The job unpacks the archive, installs, typechecks, tests, builds and publishes
+# the resulting dist/ to Pages. Nothing is committed back to the repository.
+#
+# One-time setup: Settings → Pages → Build and deployment → Source: "GitHub Actions".
+#
+# You can override the archive location/name with a repository variable:
+#   Settings → Secrets and variables → Actions → Variables → VANTA_ZIP (e.g. "site/vanta.zip")
+
+name: Build from zip and deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # default archive path; the "Locate archive" step falls back to a search
+  ZIP_PATH: ${{ vars.VANTA_ZIP || 'vanta-github.zip' }}
+  APP_DIR: app
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate archive
+        run: |
+          set -euo pipefail
+          if [ ! -f "$ZIP_PATH" ]; then
+            found=$(find . -maxdepth 3 -name '*.zip' -not -path './.git/*' | head -n 1)
+            if [ -z "$found" ]; then
+              echo "::error::No .zip file found. Commit the archive at the repo root or set the VANTA_ZIP repository variable."
+              exit 1
+            fi
+            ZIP_PATH="$found"
+          fi
+          echo "ZIP_FILE=$ZIP_PATH" >> "$GITHUB_ENV"
+          echo "Using archive: $ZIP_PATH"
+          ls -lh "$ZIP_PATH"
+
+      - name: Extract archive
+        run: |
+          set -euo pipefail
+          # ZIP_FILE comes from $GITHUB_ENV; fall back to the default path in case
+          # this step is ever run on its own (or the variable was not written).
+          ZIP="${ZIP_FILE:-$ZIP_PATH}"
+          if [ ! -f "$ZIP" ]; then
+            ZIP=$(find . -maxdepth 3 -name '*.zip' -not -path './.git/*' | head -n 1)
+          fi
+          [ -n "$ZIP" ] && [ -f "$ZIP" ] || { echo "::error::Archive not found"; exit 1; }
+          echo "Extracting $ZIP"
+          rm -rf "$RUNNER_TEMP/extract"
+          mkdir -p "$RUNNER_TEMP/extract"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/extract"
+
+          # The archive may wrap the project in a directory (e.g. "vanta/").
+          # Find the directory that actually holds package.json.
+          pkg=$(find "$RUNNER_TEMP/extract" -maxdepth 3 -name package.json -not -path '*/node_modules/*' | head -n 1)
+          if [ -z "$pkg" ]; then
+            echo "::error::package.json not found inside the archive."
+            find "$RUNNER_TEMP/extract" -maxdepth 2 | head -n 40
+            exit 1
+          fi
+          root=$(dirname "$pkg")
+          echo "Project root inside archive: ${root#$RUNNER_TEMP/extract/}"
+
+          rm -rf "$APP_DIR"
+          cp -a "$root" "$APP_DIR"
+          ls -la "$APP_DIR" | head -n 30
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund || npm install --no-audit --no-fund --legacy-peer-deps
+          else
+            npm install --no-audit --no-fund --legacy-peer-deps
+          fi
+
+      - name: Typecheck
+        working-directory: app
+        run: npm run typecheck
+
+      - name: Unit tests
+        working-directory: app
+        run: npm test
+
+      - name: Build
+        working-directory: app
+        run: npm run build
+
+      - name: Sanity-check the build
+        run: |
+          set -euo pipefail
+          test -f "$APP_DIR/dist/index.html" || { echo "::error::dist/index.html missing"; exit 1; }
+          echo "Built files:"
+          du -sh "$APP_DIR/dist"
+          find "$APP_DIR/dist" -maxdepth 1 -mindepth 1 | sort
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: app/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
